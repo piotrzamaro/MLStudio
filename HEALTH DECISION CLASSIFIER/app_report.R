@@ -20,6 +20,7 @@ library(flextable)
 # (NOWE) Modele zespołowe
 library(randomForest)
 library(xgboost)
+library(httr)
 
 # 2. Ustawienia globalne ----------------------------------------------
 options(shiny.maxRequestSize = 500 * 1024^2)
@@ -255,6 +256,51 @@ ui <- fluidPage(
         margin-top: 6px;
       }
       .inline-checks .checkbox { margin: 0; }
+
+      /* AI Gemini chat */
+      .ai-chat-panel {
+        background: #ffffff;
+        border: 1px solid #eef1f5;
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: 0 6px 18px rgba(0,74,127,0.08);
+      }
+      .ai-chat-history {
+        max-height: 520px;
+        overflow-y: auto;
+        margin-bottom: 14px;
+        padding-right: 6px;
+      }
+      .ai-chat-message {
+        display: grid;
+        grid-template-columns: 44px 1fr;
+        gap: 12px;
+        padding: 12px;
+        border: 1px solid #eef1f5;
+        border-radius: 12px;
+        background: #f8fbff;
+        margin-bottom: 10px;
+      }
+      .ai-chat-message.model {
+        background: linear-gradient(135deg, rgba(0,74,127,0.05), rgba(0,163,196,0.04));
+        border-color: rgba(0,74,127,0.15);
+      }
+      .ai-chat-avatar {
+        height: 44px;
+        width: 44px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #004A7F;
+        color: #fff;
+        font-weight: 900;
+        box-shadow: 0 6px 14px rgba(0,74,127,0.16);
+      }
+      .ai-chat-avatar.model { background: #00A3C4; }
+      .ai-chat-meta { font-size: 11px; color: #6c757d; letter-spacing: 0.2px; text-transform: uppercase; }
+      .ai-chat-body { color: #2f3b52; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+      .ai-chat-actions { display: flex; gap: 10px; flex-wrap: wrap; }
     "))
   ),
   
@@ -1263,10 +1309,58 @@ ui <- fluidPage(
           fluidRow(
             column(
               12,downloadButton("download_report_docx", "POBIERZ RAPORT DOCX")
-              
+
             )
           )
-          
+
+        )
+
+        # --- Asystent Gemini ---
+        ,
+        tabPanel(
+          "Asystent AI",
+          div(class = "container-fluid",
+              br(),
+
+              div(class = "section-container",
+                  div(class = "section-header", "Asystent Gemini dla analityków"),
+                  div(class = "text-muted-small",
+                      p("Profesjonalny chat wspierany przez modele Gemini pomaga w interpretacji wyników, przygotowaniu raportu i szukaniu pomysłów na kolejne analizy."),
+                      p(tags$b("Dane uwaga:"), " klucz API nie jest zapisywany i pozostaje tylko w tej sesji przeglądarki.")
+                  )
+              ),
+
+              fluidRow(
+                column(
+                  4,
+                  div(class = "section-container",
+                      h4("Konfiguracja", style="color:#004A7F; font-weight:900;"),
+                      passwordInput("gemini_api_key", "Klucz API Gemini", placeholder = "wpisz klucz..."),
+                      selectInput("gemini_model", "Model", choices = c("gemini-1.5-flash", "gemini-1.5-pro"), selected = "gemini-1.5-flash"),
+                      textAreaInput(
+                        "ai_system_prompt", "Kontekst rozmowy",
+                        value = "Jesteś analitycznym asystentem ML w ochronie zdrowia. Odpowiadasz rzeczowo, podając klarowne rekomendacje kroków analitycznych.",
+                        rows = 5, resize = "vertical"
+                      ),
+                      div(class = "ai-chat-actions",
+                          actionButton("clear_ai_chat", "Wyczyść wątek", icon = icon("trash"), class = "btn-secondary")
+                      )
+                  )
+                ),
+                column(
+                  8,
+                  div(class = "ai-chat-panel",
+                      div(class = "section-header", "Okno rozmowy"),
+                      div(class = "ai-chat-history", uiOutput("ai_chat_history")),
+                      textAreaInput("ai_user_message", "Twoja wiadomość", placeholder = "Opisz problem, poproś o podsumowanie wyników lub wygenerowanie sugestii raportu...", rows = 4, resize = "vertical"),
+                      div(class = "ai-chat-actions",
+                          actionButton("send_ai_message", "Wyślij do Gemini", icon = icon("paper-plane"), class = "btn-primary"),
+                          actionButton("insert_last_metrics", "Wklej ostatnie metryki", icon = icon("paste"), class = "btn-outline-primary")
+                      )
+                  )
+                )
+              )
+          )
         )
       )
     )
@@ -2340,7 +2434,143 @@ server <- function(input, output, session) {
       Wartość = c(round(m$acc, 4), round(m$prec, 4), round(m$rec, 4), round(m$f1, 4))
     )
   }, rownames = FALSE)
-  
+
+  # --- Asystent Gemini (chat) ---
+  chat_history <- reactiveVal(list())
+
+  render_chat_bubble <- function(role, text) {
+    role_class <- ifelse(role == "model", "model", "user")
+    avatar_text <- ifelse(role_class == "model", "G", "TY")
+    title <- ifelse(role_class == "model", "Gemini", "Użytkownik")
+
+    div(
+      class = paste("ai-chat-message", role_class),
+      div(class = paste("ai-chat-avatar", role_class), avatar_text),
+      div(
+        div(class = "ai-chat-meta", title),
+        div(class = "ai-chat-body", text)
+      )
+    )
+  }
+
+  output$ai_chat_history <- renderUI({
+    history <- chat_history()
+    if (length(history) == 0) {
+      return(div(class = "text-muted-small", "Czekam na pierwszą wiadomość..."))
+    }
+
+    tagList(lapply(history, function(msg) {
+      render_chat_bubble(msg$role, msg$text)
+    }))
+  })
+
+  call_gemini_api <- function(conversation, api_key, model, system_prompt) {
+    url <- paste0(
+      "https://generativelanguage.googleapis.com/v1beta/models/",
+      model,
+      ":generateContent?key=",
+      api_key
+    )
+
+    body <- list(
+      contents = lapply(conversation, function(msg) {
+        list(
+          role = ifelse(msg$role == "model", "model", "user"),
+          parts = list(list(text = msg$text))
+        )
+      })
+    )
+
+    if (!is.null(system_prompt) && nzchar(trimws(system_prompt))) {
+      body$system_instruction <- list(parts = list(list(text = system_prompt)))
+    }
+
+    res <- httr::POST(url, body = body, encode = "json", httr::timeout(30))
+
+    if (httr::http_error(res)) {
+      detail <- tryCatch(httr::content(res, as = "text", encoding = "UTF-8"), error = function(e) NULL)
+      stop(paste("Błąd API", httr::status_code(res), detail))
+    }
+
+    parsed <- httr::content(res, as = "parsed", type = "application/json")
+    candidate <- tryCatch(parsed$candidates[[1]]$content$parts[[1]]$text, error = function(e) NULL)
+
+    if (is.null(candidate) || identical(candidate, character(0))) {
+      stop("Brak odpowiedzi od Gemini.")
+    }
+
+    candidate
+  }
+
+  observeEvent(input$send_ai_message, {
+    msg <- trimws(input$ai_user_message)
+    if (is.null(msg) || !nzchar(msg)) {
+      showNotification("Wpisz wiadomość przed wysłaniem do Gemini.", type = "warning")
+      return()
+    }
+
+    api_key <- trimws(input$gemini_api_key)
+    if (is.null(api_key) || !nzchar(api_key)) {
+      showNotification("Wprowadź klucz API Gemini, aby wysłać wiadomość.", type = "warning")
+      return()
+    }
+
+    current_history <- chat_history()
+    new_history <- append(current_history, list(list(role = "user", text = msg)))
+    chat_history(new_history)
+    updateTextAreaInput(session, "ai_user_message", value = "")
+
+    model_choice <- if (!is.null(input$gemini_model) && nzchar(input$gemini_model)) input$gemini_model else "gemini-1.5-flash"
+    system_prompt <- if (is.null(input$ai_system_prompt)) "" else input$ai_system_prompt
+
+    tryCatch({
+      reply <- call_gemini_api(new_history, api_key, model_choice, system_prompt)
+      chat_history(append(new_history, list(list(role = "model", text = reply))))
+    }, error = function(e) {
+      showNotification(paste("Gemini:", e$message), type = "error")
+    })
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$clear_ai_chat, {
+    chat_history(list())
+    updateTextAreaInput(session, "ai_user_message", value = "")
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$insert_last_metrics, {
+    res <- tryCatch(test_res(), error = function(e) NULL)
+    if (is.null(res)) {
+      showNotification("Brak obliczonych metryk – uruchom model, aby wstawić podsumowanie.", type = "warning")
+      return()
+    }
+
+    m <- res$metrics
+    summary_line <- paste0(
+      "Accuracy: ", round(m$acc * 100, 2), "%, ",
+      "Precision: ", round(m$prec * 100, 2), "%, ",
+      "Recall: ", round(m$rec * 100, 2), "%, ",
+      "F1: ", round(m$f1 * 100, 2), "%"
+    )
+
+    conf_text <- tryCatch(
+      paste(capture.output(print(as.data.frame.matrix(res$conf))), collapse = "\n"),
+      error = function(e) NULL
+    )
+
+    snippet <- paste(
+      "Podsumowanie jakości modelu:",
+      summary_line,
+      if (!is.null(conf_text)) paste0("Macierz konfuzji:\n", conf_text) else NULL,
+      sep = "\n"
+    )
+
+    current <- input$ai_user_message
+    if (!is.null(current) && nzchar(trimws(current))) {
+      snippet <- paste(snippet, "\n\n", current)
+    }
+
+    updateTextAreaInput(session, "ai_user_message", value = snippet)
+  }, ignoreInit = TRUE)
+
   fmt_pct <- function(x, digits = 2) {
     if (is.null(x) || is.na(x)) return("–")
     paste0(round(x * 100, digits), "%")
